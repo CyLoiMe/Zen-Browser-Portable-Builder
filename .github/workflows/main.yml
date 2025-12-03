@@ -46,10 +46,6 @@ jobs:
         
         Invoke-WebRequest -Uri $downloadUrl -OutFile "zen_installer.exe"
         echo "VERSION=$version" >> $env:GITHUB_OUTPUT
-        
-        # --- 调试：确认下载成功 ---
-        Write-Host "Checking downloaded file:"
-        ls zen_installer.exe
 
     - name: Extract Installer
       shell: powershell
@@ -58,24 +54,27 @@ jobs:
         New-Item -ItemType Directory -Force -Path "ZenBrowserPortable\App\AppInfo"
         New-Item -ItemType Directory -Force -Path "ZenBrowserPortable\Data"
         
-        # 解压
         7z x "zen_installer.exe" -o"TempExtract" -y
         
-        # --- 调试：列出解压内容，看看里面到底有啥 ---
-        Write-Host "Listing extracted content (Root):"
-        ls TempExtract
         if (Test-Path "TempExtract\core") {
-            Write-Host "Listing extracted content (Core):"
-            ls TempExtract\core
             Move-Item "TempExtract\core\*" "ZenBrowserPortable\App\ZenBrowser"
         } else {
-            Write-Host "Core folder missing! Moving everything..."
             Move-Item "TempExtract\*" "ZenBrowserPortable\App\ZenBrowser"
         }
+
+    # === 自动植入禁止更新策略 ===
+    - name: Apply Disable Update Policy
+      shell: powershell
+      run: |
+        # 1. 创建 distribution 文件夹
+        $distPath = "ZenBrowserPortable\App\ZenBrowser\distribution"
+        New-Item -ItemType Directory -Force -Path $distPath
         
-        # --- 调试：确认目标文件夹不为空 ---
-        Write-Host "Checking target folder:"
-        ls ZenBrowserPortable\App\ZenBrowser
+        # 2. 写入策略内容
+        $jsonContent = '{ "policies": { "DisableAppUpdate": true, "ManualAppUpdateOnly": true } }'
+        Set-Content -Path "$distPath\policies.json" -Value $jsonContent
+        
+        Write-Host "Policy file created at $distPath\policies.json"
 
     - name: Compile Launcher
       shell: cmd
@@ -90,25 +89,13 @@ jobs:
       run: |
         $ver = "${{ steps.download.outputs.VERSION }}"
         $zipName = "ZenBrowserPortable_$ver.zip"
-        
-        # 压缩
         Compress-Archive -Path "ZenBrowserPortable" -DestinationPath $zipName
-        
-        # --- 调试：确认 ZIP 真的存在 ---
-        if (Test-Path $zipName) {
-            Write-Host "SUCCESS: Zip created at $zipName"
-            ls $zipName
-        } else {
-            Write-Error "ERROR: Zip file was NOT created!"
-            exit 1
-        }
 
     - name: Upload Release
       uses: softprops/action-gh-release@v1
       with:
         tag_name: ${{ steps.download.outputs.VERSION }}
         name: Zen Browser Portable ${{ steps.download.outputs.VERSION }}
-        # --- 核心修改：使用通配符，不再依赖变量，只要有zip就传 ---
         files: "*.zip"
         draft: false
         prerelease: false
