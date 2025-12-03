@@ -2,20 +2,21 @@ name: Build Zen Browser Portable
 
 on:
   schedule:
-    - cron: '0 2 * * *'
-  workflow_dispatch:
+    - cron: '0 2 * * *' # 每天 UTC 02:00 (北京时间 10:00) 运行
+  workflow_dispatch: # 允许手动点按钮运行
 
 jobs:
   build:
     runs-on: windows-latest
     permissions:
-      contents: write
+      contents: write # 允许发布 Release
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Find and Download zen.installer.exe
+    # 1. 寻找并下载 zen.installer.exe
+    - name: Find and Download Installer
       id: download
       shell: powershell
       env:
@@ -23,11 +24,18 @@ jobs:
       run: |
         $url = "https://api.github.com/repos/zen-browser/desktop/releases?per_page=5"
         $headers = @{ "Authorization" = "token $env:GH_TOKEN" }
-        $releases = Invoke-RestMethod -Uri $url -Method Get -Headers $headers
         
+        try {
+            $releases = Invoke-RestMethod -Uri $url -Method Get -Headers $headers
+        } catch {
+            Write-Error "API Request Failed: $($_.Exception.Message)"
+            exit 1
+        }
+
         $downloadUrl = ""
         $version = ""
 
+        # 精确匹配 zen.installer.exe
         foreach ($release in $releases) {
             foreach ($asset in $release.assets) {
                 if ($asset.name -eq "zen.installer.exe") {
@@ -39,51 +47,76 @@ jobs:
             if ($downloadUrl) { break }
         }
 
-        if (-not $downloadUrl) { Write-Error "File not found!"; exit 1 }
+        if (-not $downloadUrl) {
+            Write-Error "Could not find 'zen.installer.exe' in recent releases."
+            exit 1
+        }
 
-        Write-Host "Target: $version"
-        Write-Host "URL: $downloadUrl"
+        Write-Host "Target Version: $version"
+        Write-Host "Download URL: $downloadUrl"
         
         Invoke-WebRequest -Uri $downloadUrl -OutFile "zen_installer.exe"
         echo "VERSION=$version" >> $env:GITHUB_OUTPUT
 
-    - name: Extract Installer
+    # 2. 解压安装包
+    - name: Extract Installer (7-Zip)
       shell: powershell
       run: |
         New-Item -ItemType Directory -Force -Path "ZenBrowserPortable\App\ZenBrowser"
         New-Item -ItemType Directory -Force -Path "ZenBrowserPortable\App\AppInfo"
         New-Item -ItemType Directory -Force -Path "ZenBrowserPortable\Data"
         
+        # 强行解压 exe
         7z x "zen_installer.exe" -o"TempExtract" -y
         
-        if (Test-Path "TempExtract\core") {
-            Move-Item "TempExtract\core\*" "ZenBrowserPortable\App\ZenBrowser"
+        # 移动 core 文件夹内容
+        $corePath = "TempExtract\core"
+        if (Test-Path $corePath) {
+            Move-Item "$corePath\*" "ZenBrowserPortable\App\ZenBrowser"
         } else {
-            Move-Item "TempExtract\*" "ZenBrowserPortable\App\ZenBrowser"
+            # 兜底方案：寻找 zen.exe
+            $zenExe = Get-ChildItem -Path "TempExtract" -Filter "zen.exe" -Recurse | Select-Object -First 1
+            if ($zenExe) {
+                Move-Item "$($zenExe.DirectoryName)\*" "ZenBrowserPortable\App\ZenBrowser"
+            } else {
+                Write-Error "Extraction failed: zen.exe not found."
+                exit 1
+            }
         }
 
-    # === 自动植入禁止更新策略 ===
-    - name: Apply Disable Update Policy
+    # 3. 生成策略文件 (禁用浏览器内部更新)
+    - name: Create Policy to Disable Updates
       shell: powershell
       run: |
-        # 1. 创建 distribution 文件夹
-        $distPath = "ZenBrowserPortable\App\ZenBrowser\distribution"
-        New-Item -ItemType Directory -Force -Path $distPath
-        
-        # 2. 写入策略内容
-        $jsonContent = '{ "policies": { "DisableAppUpdate": true, "ManualAppUpdateOnly": true } }'
-        Set-Content -Path "$distPath\policies.json" -Value $jsonContent
-        
-        Write-Host "Policy file created at $distPath\policies.json"
+        $distDir = "ZenBrowserPortable\App\ZenBrowser\distribution"
+        New-Item -ItemType Directory -Force -Path $distDir
+        $policyContent = '{ "policies": { "DisableAppUpdate": true, "ManualAppUpdateOnly": true } }'
+        Set-Content -Path "$distDir\policies.json" -Value $policyContent
+        Write-Host "Internal updater disabled."
 
+    # 4. 生成版本文件 (供启动器读取)
+    - name: Create Version File
+      shell: powershell
+      run: |
+        $ver = "${{ steps.download.outputs.VERSION }}"
+        Set-Content -Path "ZenBrowserPortable\App\AppInfo\version.txt" -Value $ver
+
+    # 5. 编译启动器
     - name: Compile Launcher
       shell: cmd
       run: |
         copy appinfo.ini ZenBrowserPortable\App\AppInfo\
         if exist appicon.ico copy appicon.ico ZenBrowserPortable\App\AppInfo\
+        
         set CSC=%windir%\Microsoft.NET\Framework64\v4.0.30319\csc.exe
-        "%CSC%" /target:exe /out:ZenBrowserPortable\ZenBrowserPortable.exe /r:System.Windows.Forms.dll Launcher.cs
+        
+        if exist appicon.ico (
+            "%CSC%" /target:exe /out:ZenBrowserPortable\ZenBrowserPortable.exe /win32icon:appicon.ico /r:System.Windows.Forms.dll Launcher.cs
+        ) else (
+            "%CSC%" /target:exe /out:ZenBrowserPortable\ZenBrowserPortable.exe /r:System.Windows.Forms.dll Launcher.cs
+        )
 
+    # 6. 打包 Zip
     - name: Package to ZIP
       shell: powershell
       run: |
@@ -91,6 +124,7 @@ jobs:
         $zipName = "ZenBrowserPortable_$ver.zip"
         Compress-Archive -Path "ZenBrowserPortable" -DestinationPath $zipName
 
+    # 7. 上传 Release (暴力覆盖模式)
     - name: Upload Release
       uses: softprops/action-gh-release@v1
       with:
