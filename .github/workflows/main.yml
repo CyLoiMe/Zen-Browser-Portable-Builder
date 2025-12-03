@@ -2,14 +2,14 @@ name: Build Zen Browser Portable
 
 on:
   schedule:
-    - cron: '0 2 * * *' # 每天运行
-  workflow_dispatch: # 允许手动触发
+    - cron: '0 2 * * *'
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-latest
     permissions:
-      contents: write # 读写权限
+      contents: write
 
     steps:
     - name: Checkout code
@@ -21,21 +21,13 @@ jobs:
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        # 1. 获取发布列表
         $url = "https://api.github.com/repos/zen-browser/desktop/releases?per_page=5"
         $headers = @{ "Authorization" = "token $env:GH_TOKEN" }
+        $releases = Invoke-RestMethod -Uri $url -Method Get -Headers $headers
         
-        try {
-            $releases = Invoke-RestMethod -Uri $url -Method Get -Headers $headers
-        } catch {
-            Write-Error "API Request Failed: $($_.Exception.Message)"
-            exit 1
-        }
-
         $downloadUrl = ""
         $version = ""
 
-        # 2. 精确寻找 zen.installer.exe
         foreach ($release in $releases) {
             foreach ($asset in $release.assets) {
                 if ($asset.name -eq "zen.installer.exe") {
@@ -47,69 +39,77 @@ jobs:
             if ($downloadUrl) { break }
         }
 
-        if (-not $downloadUrl) {
-            Write-Error "Could not find 'zen.installer.exe'!"
-            exit 1
-        }
+        if (-not $downloadUrl) { Write-Error "File not found!"; exit 1 }
 
         Write-Host "Target: $version"
         Write-Host "URL: $downloadUrl"
         
         Invoke-WebRequest -Uri $downloadUrl -OutFile "zen_installer.exe"
         echo "VERSION=$version" >> $env:GITHUB_OUTPUT
+        
+        # --- 调试：确认下载成功 ---
+        Write-Host "Checking downloaded file:"
+        ls zen_installer.exe
 
-    # --- 移除了“Check if Release Exists”步骤，强制往下执行 ---
-
-    - name: Extract Installer (7-Zip)
+    - name: Extract Installer
       shell: powershell
       run: |
         New-Item -ItemType Directory -Force -Path "ZenBrowserPortable\App\ZenBrowser"
         New-Item -ItemType Directory -Force -Path "ZenBrowserPortable\App\AppInfo"
         New-Item -ItemType Directory -Force -Path "ZenBrowserPortable\Data"
         
-        # 解压安装包
+        # 解压
         7z x "zen_installer.exe" -o"TempExtract" -y
         
-        # 提取 core 文件夹
-        $corePath = "TempExtract\core"
-        if (Test-Path $corePath) {
-            Move-Item "$corePath\*" "ZenBrowserPortable\App\ZenBrowser"
+        # --- 调试：列出解压内容，看看里面到底有啥 ---
+        Write-Host "Listing extracted content (Root):"
+        ls TempExtract
+        if (Test-Path "TempExtract\core") {
+            Write-Host "Listing extracted content (Core):"
+            ls TempExtract\core
+            Move-Item "TempExtract\core\*" "ZenBrowserPortable\App\ZenBrowser"
         } else {
-            # 备用方案
-            $zenExe = Get-ChildItem -Path "TempExtract" -Filter "zen.exe" -Recurse | Select-Object -First 1
-            if ($zenExe) {
-                Move-Item "$($zenExe.DirectoryName)\*" "ZenBrowserPortable\App\ZenBrowser"
-            }
+            Write-Host "Core folder missing! Moving everything..."
+            Move-Item "TempExtract\*" "ZenBrowserPortable\App\ZenBrowser"
         }
+        
+        # --- 调试：确认目标文件夹不为空 ---
+        Write-Host "Checking target folder:"
+        ls ZenBrowserPortable\App\ZenBrowser
 
     - name: Compile Launcher
       shell: cmd
       run: |
         copy appinfo.ini ZenBrowserPortable\App\AppInfo\
         if exist appicon.ico copy appicon.ico ZenBrowserPortable\App\AppInfo\
-        
         set CSC=%windir%\Microsoft.NET\Framework64\v4.0.30319\csc.exe
-        
-        if exist appicon.ico (
-            "%CSC%" /target:exe /out:ZenBrowserPortable\ZenBrowserPortable.exe /win32icon:appicon.ico /r:System.Windows.Forms.dll Launcher.cs
-        ) else (
-            "%CSC%" /target:exe /out:ZenBrowserPortable\ZenBrowserPortable.exe /r:System.Windows.Forms.dll Launcher.cs
-        )
+        "%CSC%" /target:exe /out:ZenBrowserPortable\ZenBrowserPortable.exe /r:System.Windows.Forms.dll Launcher.cs
 
     - name: Package to ZIP
       shell: powershell
       run: |
         $ver = "${{ steps.download.outputs.VERSION }}"
         $zipName = "ZenBrowserPortable_$ver.zip"
+        
+        # 压缩
         Compress-Archive -Path "ZenBrowserPortable" -DestinationPath $zipName
-        echo "ZIP_NAME=$zipName" >> $env:GITHUB_OUTPUT
+        
+        # --- 调试：确认 ZIP 真的存在 ---
+        if (Test-Path $zipName) {
+            Write-Host "SUCCESS: Zip created at $zipName"
+            ls $zipName
+        } else {
+            Write-Error "ERROR: Zip file was NOT created!"
+            exit 1
+        }
 
-    - name: Upload Release (Force Update)
+    - name: Upload Release
       uses: softprops/action-gh-release@v1
       with:
         tag_name: ${{ steps.download.outputs.VERSION }}
         name: Zen Browser Portable ${{ steps.download.outputs.VERSION }}
-        files: ${{ steps.package.outputs.ZIP_NAME }}
+        # --- 核心修改：使用通配符，不再依赖变量，只要有zip就传 ---
+        files: "*.zip"
         draft: false
         prerelease: false
       env:
