@@ -47,7 +47,10 @@ jobs:
         
         Write-Host "Target: $version"
         Invoke-WebRequest -Uri $downloadUrl -OutFile "zen_installer.exe"
-        echo "VERSION=$version" >> $env:GITHUB_OUTPUT
+        
+        # === 核心修复：写入全局环境变量 GITHUB_ENV ===
+        # 这样后续所有步骤（包括 Upload）都能通过 ${{ env.VERSION }} 读取到它
+        echo "VERSION=$version" >> $env:GITHUB_ENV
 
     # 2. 解压 Zen Browser
     - name: Extract Installer
@@ -56,7 +59,6 @@ jobs:
         New-Item -ItemType Directory -Force -Path "ZenBrowserPortable\App\ZenBrowser"
         New-Item -ItemType Directory -Force -Path "ZenBrowserPortable\App\AppInfo"
         New-Item -ItemType Directory -Force -Path "ZenBrowserPortable\Data"
-        # 保留这个空目录，为了符合 PAF 标准结构，方便本地打包
         New-Item -ItemType Directory -Force -Path "ZenBrowserPortable\Other\Source"
         
         7z x "zen_installer.exe" -o"TempExtract" -y
@@ -68,58 +70,31 @@ jobs:
             if ($zenExe) { Move-Item "$($zenExe.DirectoryName)\*" "ZenBrowserPortable\App\ZenBrowser" }
         }
 
-    # 3. 配置策略与版本 (保留所有 PAF 配置，方便本地打包)
+    # 3. 配置策略与版本
     - name: Configure App
       shell: powershell
       run: |
-        # 禁用更新
         $distDir = "ZenBrowserPortable\App\ZenBrowser\distribution"
         New-Item -ItemType Directory -Force -Path $distDir
         Set-Content -Path "$distDir\policies.json" -Value '{ "policies": { "DisableAppUpdate": true, "ManualAppUpdateOnly": true } }'
 
-        # 写入版本号
-        $ver = "${{ steps.find_download.outputs.VERSION }}"
-        if (-not $ver) { $ver = "${{ env.VERSION }}" }
+        # 直接读取环境变量
+        $ver = $env:VERSION
         Set-Content -Path "ZenBrowserPortable\App\AppInfo\version.txt" -Value $ver
 
-        # 生成标准的 appinfo.ini
         $safeVer = $ver -replace "[^0-9.]", ""
         while (($safeVer.ToCharArray() | Where-Object { $_ -eq '.' }).Count -lt 3) { $safeVer += ".0" }
         
-        # 重新生成 ini，确保编码正确 (ASCII)
-        $iniContent = @"
-        [Format]
-        Type=PortableApps.comFormat
-        Version=3.5
-
-        [Details]
-        Name=Zen Browser Portable
-        AppID=ZenBrowserPortable
-        Publisher=Zen Team & GitHub Actions
-        Homepage=https://github.com/zen-browser/desktop
-        Category=Internet
-        Description=Zen Browser Portable
-        Language=Multilingual
-
-        [License]
-        Shareable=true
-        OpenSource=true
-        Freeware=true
-        CommercialUse=true
-
-        [Version]
-        PackageVersion=$safeVer
-        DisplayVersion=$ver
-
-        [Control]
-        Icons=1
-        Start=ZenBrowserPortable.exe
-        "@
-
         $iniPath = "ZenBrowserPortable\App\AppInfo\appinfo.ini"
-        [System.IO.File]::WriteAllText($iniPath, $iniContent, [System.Text.Encoding]::ASCII)
+        $content = Get-Content "appinfo.ini"
+        $content = $content -replace "PackageVersion=1.0.0.0", "PackageVersion=$safeVer"
+        $content = $content -replace "DisplayVersion=Latest", "DisplayVersion=$ver"
+        if ($content -notcontains "CommercialUse=true") {
+            $content = $content -replace "\[License\]", "[License]`r`nCommercialUse=true"
+        }
+        [System.IO.File]::WriteAllText($iniPath, $content, [System.Text.Encoding]::Default)
 
-    # 4. 创建 help.html (PAF 标准)
+    # 4. 创建 help.html
     - name: Create Help File
       shell: powershell
       run: |
@@ -133,40 +108,89 @@ jobs:
         set CSC=%windir%\Microsoft.NET\Framework64\v4.0.30319\csc.exe
         "%CSC%" /target:exe /out:ZenBrowserPortable\ZenBrowserPortable.exe /win32icon:appicon.ico /r:System.Windows.Forms.dll Launcher.cs
 
-    # 6. 生成图标 (生成全套 PNG，方便你本地打包时不弹窗)
+    # 6. 生成图标
     - name: Generate PAF Icons
       shell: powershell
       run: |
         Add-Type -AssemblyName System.Drawing
         $icoPath = "appicon.ico"
         $destDir = "ZenBrowserPortable\App\AppInfo"
-        
-        if (Test-Path $icoPath) {
-            $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($icoPath)
-            $bmp = $icon.ToBitmap()
-            foreach ($size in 16, 32, 128) {
-                $resized = new-object System.Drawing.Bitmap($bmp, $size, $size)
-                $resized.Save("$destDir\appicon_$size.png", [System.Drawing.Imaging.ImageFormat]::Png)
-            }
-            Copy-Item $icoPath "$destDir\appicon.ico" -Force
+        if (-not (Test-Path $icoPath)) { Write-Error "appicon.ico missing!"; exit 1 }
+        $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($icoPath)
+        $bmp = $icon.ToBitmap()
+        foreach ($size in 16, 32, 128) {
+            $resized = new-object System.Drawing.Bitmap($bmp, $size, $size)
+            $resized.Save("$destDir\appicon_$size.png", [System.Drawing.Imaging.ImageFormat]::Png)
         }
+        Copy-Item $icoPath "$destDir\appicon.ico" -Force
 
-    # 7. 仅打包 ZIP (跳过 PAF 安装包制作)
-    - name: Package to ZIP
+    # 7. 解压并准备环境 (搬家到 C:\B)
+    - name: Prepare Build Environment
       shell: powershell
       run: |
-        $ver = Get-Content "ZenBrowserPortable\App\AppInfo\version.txt"
-        $zipName = "ZenBrowserPortable_${ver}.zip"
+        if (-not (Test-Path "InstallerTool.zip")) { Write-Error "InstallerTool.zip missing!"; exit 1 }
         
-        Write-Host "Creating ZIP: $zipName"
-        Compress-Archive -Path "ZenBrowserPortable" -DestinationPath $zipName
+        New-Item -ItemType Directory -Force -Path "C:\B"
+        7z x "InstallerTool.zip" -o"C:\B\Tool" -y
+        Move-Item "ZenBrowserPortable" "C:\B\ZenBrowserPortable"
+        
+        Write-Host "Files moved to C:\B"
 
-    # 8. 上传
+    # 8. 执行打包 (路径修正 + CMD调用)
+    - name: Build .paf.exe Package
+      shell: powershell
+      run: |
+        # 直接指定根目录 EXE (根据你的反馈)
+        $pafExe = "C:\B\Tool\PortableApps.comInstaller.exe"
+        
+        if (-not (Test-Path $pafExe)) { 
+            Write-Error "FATAL: InstallerTool EXE not found at $pafExe"
+            ls "C:\B\Tool"
+            exit 1 
+        }
+        
+        $builderPath = $pafExe
+        $sourcePath = "C:\B\ZenBrowserPortable"
+        
+        Write-Host "Builder: $builderPath"
+        
+        # 启动进程 (20分钟超时)
+        $p = Start-Process -FilePath $builderPath -ArgumentList "`"$sourcePath`"" -PassThru
+        try {
+            $p | Wait-Process -Timeout 1200
+            Write-Host "PAF Build finished successfully."
+        } catch {
+            $p | Stop-Process -Force
+            Write-Warning "PAF Build TIMED OUT (20min)! Killing process."
+            Write-Warning "Continuing to ZIP upload..."
+        }
+
+    # 9. 搬回文件并上传
+    - name: Finalize Packages
+      shell: powershell
+      run: |
+        $ver = $env:VERSION
+        
+        # 找回生成的 .paf.exe
+        $pafFile = Get-ChildItem -Path "C:\B" -Filter "*.paf.exe" | Select-Object -First 1
+        if ($pafFile) { 
+            # 搬回工作目录
+            Move-Item $pafFile.FullName ".\ZenBrowserPortable_${ver}.paf.exe"
+            Write-Host "SUCCESS: Installer recovered."
+        }
+        
+        # 打包 ZIP
+        Compress-Archive -Path "C:\B\ZenBrowserPortable" -DestinationPath "ZenBrowserPortable_${ver}.zip"
+
+    # 10. 上传
     - name: Upload Release
       uses: softprops/action-gh-release@v1
       with:
+        # 这里引用全局变量，现在肯定有值了
         tag_name: ${{ env.VERSION }}
         name: Zen Browser Portable ${{ env.VERSION }}
-        files: "*.zip"
+        files: |
+          *.zip
+          *.paf.exe
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
