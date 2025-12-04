@@ -2,14 +2,14 @@ name: Build Zen Browser Portable
 
 on:
   schedule:
-    - cron: '0 2 * * *' # 每天 UTC 02:00 (北京时间 10:00) 运行
-  workflow_dispatch: # 允许手动点按钮运行
+    - cron: '0 2 * * *' # 每天自动运行
+  workflow_dispatch: # 允许手动触发
 
 jobs:
   build:
     runs-on: windows-latest
     permissions:
-      contents: write # 允许发布 Release
+      contents: write # 必须权限
 
     steps:
     - name: Checkout code
@@ -35,7 +35,7 @@ jobs:
         $downloadUrl = ""
         $version = ""
 
-        # 精确匹配 zen.installer.exe
+        # 精确寻找 zen.installer.exe
         foreach ($release in $releases) {
             foreach ($asset in $release.assets) {
                 if ($asset.name -eq "zen.installer.exe") {
@@ -66,15 +66,12 @@ jobs:
         New-Item -ItemType Directory -Force -Path "ZenBrowserPortable\App\AppInfo"
         New-Item -ItemType Directory -Force -Path "ZenBrowserPortable\Data"
         
-        # 强行解压 exe
         7z x "zen_installer.exe" -o"TempExtract" -y
         
-        # 移动 core 文件夹内容
         $corePath = "TempExtract\core"
         if (Test-Path $corePath) {
             Move-Item "$corePath\*" "ZenBrowserPortable\App\ZenBrowser"
         } else {
-            # 兜底方案：寻找 zen.exe
             $zenExe = Get-ChildItem -Path "TempExtract" -Filter "zen.exe" -Recurse | Select-Object -First 1
             if ($zenExe) {
                 Move-Item "$($zenExe.DirectoryName)\*" "ZenBrowserPortable\App\ZenBrowser"
@@ -84,7 +81,7 @@ jobs:
             }
         }
 
-    # 3. 生成策略文件 (禁用浏览器内部更新)
+    # 3. 生成策略文件 (禁用内部更新)
     - name: Create Policy to Disable Updates
       shell: powershell
       run: |
@@ -92,45 +89,90 @@ jobs:
         New-Item -ItemType Directory -Force -Path $distDir
         $policyContent = '{ "policies": { "DisableAppUpdate": true, "ManualAppUpdateOnly": true } }'
         Set-Content -Path "$distDir\policies.json" -Value $policyContent
-        Write-Host "Internal updater disabled."
 
-    # 4. 生成版本文件 (供启动器读取)
-    - name: Create Version File
+    # 4. 动态修改 appinfo.ini 的版本号
+    - name: Update appinfo.ini Version
       shell: powershell
       run: |
         $ver = "${{ steps.download.outputs.VERSION }}"
+        
+        # 生成纯数字版本号 (例如 1.17.12b -> 1.17.12.0)
+        $safeVer = $ver -replace "[^0-9.]", ""
+        while (($safeVer.ToCharArray() | Where-Object { $_ -eq '.' }).Count -lt 3) {
+            $safeVer += ".0"
+        }
+        
+        Write-Host "Raw Version: $ver"
+        Write-Host "Safe Version: $safeVer"
+        
+        $path = "ZenBrowserPortable\App\AppInfo\appinfo.ini"
+        
+        (Get-Content "appinfo.ini") -replace "PackageVersion=1.0.0.0", "PackageVersion=$safeVer" `
+                                    -replace "DisplayVersion=Latest", "DisplayVersion=$ver" `
+                                    | Set-Content "ZenBrowserPortable\App\AppInfo\appinfo.ini"
+
+        # 生成 version.txt
         Set-Content -Path "ZenBrowserPortable\App\AppInfo\version.txt" -Value $ver
 
     # 5. 编译启动器
     - name: Compile Launcher
       shell: cmd
       run: |
-        copy appinfo.ini ZenBrowserPortable\App\AppInfo\
-        if exist appicon.ico copy appicon.ico ZenBrowserPortable\App\AppInfo\
-        
+        copy appicon.ico ZenBrowserPortable\App\AppInfo\
         set CSC=%windir%\Microsoft.NET\Framework64\v4.0.30319\csc.exe
-        
-        if exist appicon.ico (
-            "%CSC%" /target:exe /out:ZenBrowserPortable\ZenBrowserPortable.exe /win32icon:appicon.ico /r:System.Windows.Forms.dll Launcher.cs
-        ) else (
-            "%CSC%" /target:exe /out:ZenBrowserPortable\ZenBrowserPortable.exe /r:System.Windows.Forms.dll Launcher.cs
-        )
+        "%CSC%" /target:exe /out:ZenBrowserPortable\ZenBrowserPortable.exe /win32icon:appicon.ico /r:System.Windows.Forms.dll Launcher.cs
 
-    # 6. 打包 Zip
+    # 6. 设置 PortableApps.com Installer 
+    - name: Setup PortableApps.com Installer
+      shell: powershell
+      run: |
+        # === 使用 SourceForge 稳定直链下载 3.9.5 ===
+        $toolUrl = "https://downloads.sourceforge.net/portableapps/PortableApps.comInstaller_3.9.5.paf.exe"
+        
+        Write-Host "Downloading Installer Tool from: $toolUrl"
+        Invoke-WebRequest -Uri $toolUrl -OutFile "InstallerTool.exe"
+        
+        # 解压工具
+        7z x "InstallerTool.exe" -o"PAF_Installer" -y
+
+    # 7. 生成 .paf.exe 安装包
+    - name: Build .paf.exe Package
+      shell: cmd
+      run: |
+        "PAF_Installer\App\PortableApps.comInstaller\PortableApps.comInstaller.exe" "%CD%\ZenBrowserPortable"
+
+    # 8. 重命名生成的 .paf.exe
+    - name: Rename PAF Installer
+      shell: powershell
+      run: |
+        $ver = "${{ steps.download.outputs.VERSION }}"
+        $pafFile = Get-ChildItem -Path . -Filter "*.paf.exe" | Select-Object -First 1
+        if ($pafFile) {
+            $newName = "ZenBrowserPortable_${ver}.paf.exe"
+            Rename-Item -Path $pafFile.FullName -NewName $newName
+            Write-Host "Renamed $($pafFile.Name) to $newName"
+        } else {
+            Write-Error "PAF Installer generation failed!"
+            exit 1
+        }
+
+    # 9. 生成 ZIP 包
     - name: Package to ZIP
       shell: powershell
       run: |
         $ver = "${{ steps.download.outputs.VERSION }}"
-        $zipName = "ZenBrowserPortable_$ver.zip"
+        $zipName = "ZenBrowserPortable_${ver}.zip"
         Compress-Archive -Path "ZenBrowserPortable" -DestinationPath $zipName
 
-    # 7. 上传 Release (暴力覆盖模式)
+    # 10. 上传所有文件
     - name: Upload Release
       uses: softprops/action-gh-release@v1
       with:
         tag_name: ${{ steps.download.outputs.VERSION }}
         name: Zen Browser Portable ${{ steps.download.outputs.VERSION }}
-        files: "*.zip"
+        files: |
+          *.zip
+          *.paf.exe
         draft: false
         prerelease: false
       env:
