@@ -15,7 +15,7 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    # 1. 寻找并下载 zen.installer.exe
+    # 1. 下载 Zen Browser
     - name: Find and Download Installer
       id: download
       shell: powershell
@@ -35,7 +35,6 @@ jobs:
         $downloadUrl = ""
         $version = ""
 
-        # 精确寻找 zen.installer.exe
         foreach ($release in $releases) {
             foreach ($asset in $release.assets) {
                 if ($asset.name -eq "zen.installer.exe") {
@@ -52,13 +51,13 @@ jobs:
             exit 1
         }
 
-        Write-Host "Target Version: $version"
-        Write-Host "Download URL: $downloadUrl"
+        Write-Host "Target: $version"
+        Write-Host "URL: $downloadUrl"
         
         Invoke-WebRequest -Uri $downloadUrl -OutFile "zen_installer.exe"
         echo "VERSION=$version" >> $env:GITHUB_OUTPUT
 
-    # 2. 解压安装包
+    # 2. 解压 Zen Browser
     - name: Extract Installer (7-Zip)
       shell: powershell
       run: |
@@ -81,8 +80,8 @@ jobs:
             }
         }
 
-    # 3. 生成策略文件 (禁用内部更新)
-    - name: Create Policy to Disable Updates
+    # 3. 生成策略文件
+    - name: Create Policy
       shell: powershell
       run: |
         $distDir = "ZenBrowserPortable\App\ZenBrowser\distribution"
@@ -90,28 +89,19 @@ jobs:
         $policyContent = '{ "policies": { "DisableAppUpdate": true, "ManualAppUpdateOnly": true } }'
         Set-Content -Path "$distDir\policies.json" -Value $policyContent
 
-    # 4. 动态修改 appinfo.ini 的版本号
-    - name: Update appinfo.ini Version
+    # 4. 修改版本号
+    - name: Update Version Info
       shell: powershell
       run: |
         $ver = "${{ steps.download.outputs.VERSION }}"
-        
-        # 生成纯数字版本号 (例如 1.17.12b -> 1.17.12.0)
         $safeVer = $ver -replace "[^0-9.]", ""
-        while (($safeVer.ToCharArray() | Where-Object { $_ -eq '.' }).Count -lt 3) {
-            $safeVer += ".0"
-        }
-        
-        Write-Host "Raw Version: $ver"
-        Write-Host "Safe Version: $safeVer"
+        while (($safeVer.ToCharArray() | Where-Object { $_ -eq '.' }).Count -lt 3) { $safeVer += ".0" }
         
         $path = "ZenBrowserPortable\App\AppInfo\appinfo.ini"
-        
         (Get-Content "appinfo.ini") -replace "PackageVersion=1.0.0.0", "PackageVersion=$safeVer" `
                                     -replace "DisplayVersion=Latest", "DisplayVersion=$ver" `
                                     | Set-Content "ZenBrowserPortable\App\AppInfo\appinfo.ini"
 
-        # 生成 version.txt
         Set-Content -Path "ZenBrowserPortable\App\AppInfo\version.txt" -Value $ver
 
     # 5. 编译启动器
@@ -122,26 +112,27 @@ jobs:
         set CSC=%windir%\Microsoft.NET\Framework64\v4.0.30319\csc.exe
         "%CSC%" /target:exe /out:ZenBrowserPortable\ZenBrowserPortable.exe /win32icon:appicon.ico /r:System.Windows.Forms.dll Launcher.cs
 
-    # 6. 设置 PortableApps.com Installer 
-    - name: Setup PortableApps.com Installer
+    # 6. 设置 PortableApps Installer
+    - name: Setup PortableApps.com Installer (Local)
       shell: powershell
       run: |
-        # === 使用 SourceForge 稳定直链下载 3.9.5 ===
-        $toolUrl = "https://downloads.sourceforge.net/portableapps/PortableApps.comInstaller_3.9.5.paf.exe"
+        # 检查仓库里有没有这个文件
+        if (-not (Test-Path "InstallerTool.exe")) {
+            Write-Error "InstallerTool.exe NOT FOUND in repository! Please upload it."
+            exit 1
+        }
         
-        Write-Host "Downloading Installer Tool from: $toolUrl"
-        Invoke-WebRequest -Uri $toolUrl -OutFile "InstallerTool.exe"
-        
-        # 解压工具
+        Write-Host "Extracting local InstallerTool.exe..."
+        # 解压本地的安装工具
         7z x "InstallerTool.exe" -o"PAF_Installer" -y
 
-    # 7. 生成 .paf.exe 安装包
+    # 7. 打包 .paf.exe
     - name: Build .paf.exe Package
       shell: cmd
       run: |
         "PAF_Installer\App\PortableApps.comInstaller\PortableApps.comInstaller.exe" "%CD%\ZenBrowserPortable"
 
-    # 8. 重命名生成的 .paf.exe
+    # 8. 重命名 .paf.exe
     - name: Rename PAF Installer
       shell: powershell
       run: |
@@ -150,13 +141,9 @@ jobs:
         if ($pafFile) {
             $newName = "ZenBrowserPortable_${ver}.paf.exe"
             Rename-Item -Path $pafFile.FullName -NewName $newName
-            Write-Host "Renamed $($pafFile.Name) to $newName"
-        } else {
-            Write-Error "PAF Installer generation failed!"
-            exit 1
         }
 
-    # 9. 生成 ZIP 包
+    # 9. 打包 ZIP
     - name: Package to ZIP
       shell: powershell
       run: |
@@ -164,7 +151,7 @@ jobs:
         $zipName = "ZenBrowserPortable_${ver}.zip"
         Compress-Archive -Path "ZenBrowserPortable" -DestinationPath $zipName
 
-    # 10. 上传所有文件
+    # 10. 上传
     - name: Upload Release
       uses: softprops/action-gh-release@v1
       with:
