@@ -2,14 +2,14 @@ name: Build Zen Browser Portable
 
 on:
   schedule:
-    - cron: '0 2 * * *' # 每天自动运行
-  workflow_dispatch: # 允许手动触发
+    - cron: '0 2 * * *'
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-latest
     permissions:
-      contents: write # 必须权限
+      contents: write
 
     steps:
     - name: Checkout code
@@ -17,24 +17,16 @@ jobs:
 
     # 1. 下载 Zen Browser
     - name: Find and Download Installer
-      id: download
       shell: powershell
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         $url = "https://api.github.com/repos/zen-browser/desktop/releases?per_page=5"
         $headers = @{ "Authorization" = "token $env:GH_TOKEN" }
+        $releases = Invoke-RestMethod -Uri $url -Method Get -Headers $headers
         
-        try {
-            $releases = Invoke-RestMethod -Uri $url -Method Get -Headers $headers
-        } catch {
-            Write-Error "API Request Failed: $($_.Exception.Message)"
-            exit 1
-        }
-
         $downloadUrl = ""
         $version = ""
-
         foreach ($release in $releases) {
             foreach ($asset in $release.assets) {
                 if ($asset.name -eq "zen.installer.exe") {
@@ -46,19 +38,14 @@ jobs:
             if ($downloadUrl) { break }
         }
 
-        if (-not $downloadUrl) {
-            Write-Error "Could not find 'zen.installer.exe' in recent releases."
-            exit 1
-        }
-
-        Write-Host "Target: $version"
-        Write-Host "URL: $downloadUrl"
+        if (-not $downloadUrl) { Write-Error "Target Not Found"; exit 1 }
         
+        Write-Host "Target: $version"
         Invoke-WebRequest -Uri $downloadUrl -OutFile "zen_installer.exe"
         echo "VERSION=$version" >> $env:GITHUB_OUTPUT
 
     # 2. 解压 Zen Browser
-    - name: Extract Installer (7-Zip)
+    - name: Extract Installer
       shell: powershell
       run: |
         New-Item -ItemType Directory -Force -Path "ZenBrowserPortable\App\ZenBrowser"
@@ -67,44 +54,32 @@ jobs:
         
         7z x "zen_installer.exe" -o"TempExtract" -y
         
-        $corePath = "TempExtract\core"
-        if (Test-Path $corePath) {
-            Move-Item "$corePath\*" "ZenBrowserPortable\App\ZenBrowser"
+        if (Test-Path "TempExtract\core") {
+            Move-Item "TempExtract\core\*" "ZenBrowserPortable\App\ZenBrowser"
         } else {
             $zenExe = Get-ChildItem -Path "TempExtract" -Filter "zen.exe" -Recurse | Select-Object -First 1
-            if ($zenExe) {
-                Move-Item "$($zenExe.DirectoryName)\*" "ZenBrowserPortable\App\ZenBrowser"
-            } else {
-                Write-Error "Extraction failed: zen.exe not found."
-                exit 1
-            }
+            if ($zenExe) { Move-Item "$($zenExe.DirectoryName)\*" "ZenBrowserPortable\App\ZenBrowser" }
         }
 
-    # 3. 生成策略文件
-    - name: Create Policy
+    # 3. 配置策略与版本
+    - name: Configure App
       shell: powershell
       run: |
         $distDir = "ZenBrowserPortable\App\ZenBrowser\distribution"
         New-Item -ItemType Directory -Force -Path $distDir
-        $policyContent = '{ "policies": { "DisableAppUpdate": true, "ManualAppUpdateOnly": true } }'
-        Set-Content -Path "$distDir\policies.json" -Value $policyContent
+        Set-Content -Path "$distDir\policies.json" -Value '{ "policies": { "DisableAppUpdate": true, "ManualAppUpdateOnly": true } }'
 
-    # 4. 修改版本号
-    - name: Update Version Info
-      shell: powershell
-      run: |
-        $ver = "${{ steps.download.outputs.VERSION }}"
+        $ver = "${{ steps.find_download.outputs.VERSION }}"
+        if (-not $ver) { $ver = "${{ env.VERSION }}" }
+        Set-Content -Path "ZenBrowserPortable\App\AppInfo\version.txt" -Value $ver
+
         $safeVer = $ver -replace "[^0-9.]", ""
         while (($safeVer.ToCharArray() | Where-Object { $_ -eq '.' }).Count -lt 3) { $safeVer += ".0" }
-        
-        $path = "ZenBrowserPortable\App\AppInfo\appinfo.ini"
         (Get-Content "appinfo.ini") -replace "PackageVersion=1.0.0.0", "PackageVersion=$safeVer" `
                                     -replace "DisplayVersion=Latest", "DisplayVersion=$ver" `
                                     | Set-Content "ZenBrowserPortable\App\AppInfo\appinfo.ini"
 
-        Set-Content -Path "ZenBrowserPortable\App\AppInfo\version.txt" -Value $ver
-
-    # 5. 编译启动器
+    # 4. 编译启动器
     - name: Compile Launcher
       shell: cmd
       run: |
@@ -112,55 +87,75 @@ jobs:
         set CSC=%windir%\Microsoft.NET\Framework64\v4.0.30319\csc.exe
         "%CSC%" /target:exe /out:ZenBrowserPortable\ZenBrowserPortable.exe /win32icon:appicon.ico /r:System.Windows.Forms.dll Launcher.cs
 
-    # 6. 设置 PortableApps Installer
-    - name: Setup PortableApps.com Installer (Local)
+    # 5. 准备打包工具 (自动寻路版)
+    - name: Setup Local PAF Installer
       shell: powershell
       run: |
-        # 检查仓库里有没有这个文件
+        # 1. 确认文件存在
         if (-not (Test-Path "InstallerTool.exe")) {
-            Write-Error "InstallerTool.exe NOT FOUND in repository! Please upload it."
+            Write-Error "CRITICAL ERROR: InstallerTool.exe is missing from repo root!"
+            ls
             exit 1
         }
         
-        Write-Host "Extracting local InstallerTool.exe..."
-        # 解压本地的安装工具
+        Write-Host "Found InstallerTool.exe, size: $((Get-Item InstallerTool.exe).Length) bytes"
+
+        # 2. 解压
         7z x "InstallerTool.exe" -o"PAF_Installer" -y
+        
+        # 3. 调试：打印解压出来的目录结构 (如果失败了方便看)
+        Write-Host "--- Debug: Listing extracted files ---"
+        Get-ChildItem -Path "PAF_Installer" -Recurse | Select-Object FullName
+        Write-Host "--- End Debug ---"
 
-    # 7. 打包 .paf.exe
+    # 6. 执行打包 (动态寻找 exe)
     - name: Build .paf.exe Package
-      shell: cmd
-      run: |
-        "PAF_Installer\App\PortableApps.comInstaller\PortableApps.comInstaller.exe" "%CD%\ZenBrowserPortable"
-
-    # 8. 重命名 .paf.exe
-    - name: Rename PAF Installer
       shell: powershell
       run: |
-        $ver = "${{ steps.download.outputs.VERSION }}"
-        $pafFile = Get-ChildItem -Path . -Filter "*.paf.exe" | Select-Object -First 1
-        if ($pafFile) {
-            $newName = "ZenBrowserPortable_${ver}.paf.exe"
-            Rename-Item -Path $pafFile.FullName -NewName $newName
+        # 自动搜索 PortableApps.comInstaller.exe 到底在哪
+        $pafExe = Get-ChildItem -Path "PAF_Installer" -Filter "PortableApps.comInstaller.exe" -Recurse | Select-Object -First 1
+        
+        if (-not $pafExe) {
+            Write-Error "Could not find 'PortableApps.comInstaller.exe' inside the extracted folder!"
+            exit 1
         }
+        
+        Write-Host "Found Builder at: $($pafExe.FullName)"
+        
+        # 构建命令参数
+        $builderPath = $pafExe.FullName
+        $sourcePath = "$PWD\ZenBrowserPortable"
+        
+        # 调用打包工具
+        Start-Process -FilePath $builderPath -ArgumentList "`"$sourcePath`"" -Wait -NoNewWindow
 
-    # 9. 打包 ZIP
-    - name: Package to ZIP
+    # 7. 重命名与压缩
+    - name: Finalize Packages
       shell: powershell
       run: |
-        $ver = "${{ steps.download.outputs.VERSION }}"
-        $zipName = "ZenBrowserPortable_${ver}.zip"
-        Compress-Archive -Path "ZenBrowserPortable" -DestinationPath $zipName
+        $ver = Get-Content "ZenBrowserPortable\App\AppInfo\version.txt"
+        
+        # 重命名 .paf.exe
+        $pafFile = Get-ChildItem -Path . -Filter "*.paf.exe" | Select-Object -First 1
+        if ($pafFile) { 
+            Rename-Item $pafFile.FullName "ZenBrowserPortable_${ver}.paf.exe" 
+            Write-Host "PAF Installer created successfully."
+        } else {
+            Write-Error "ERROR: .paf.exe was NOT created by the installer tool."
+            exit 1
+        }
+        
+        # 打包 .zip
+        Compress-Archive -Path "ZenBrowserPortable" -DestinationPath "ZenBrowserPortable_${ver}.zip"
 
-    # 10. 上传
+    # 8. 上传
     - name: Upload Release
       uses: softprops/action-gh-release@v1
       with:
-        tag_name: ${{ steps.download.outputs.VERSION }}
-        name: Zen Browser Portable ${{ steps.download.outputs.VERSION }}
+        tag_name: ${{ env.VERSION }}
+        name: Zen Browser Portable ${{ env.VERSION }}
         files: |
           *.zip
           *.paf.exe
-        draft: false
-        prerelease: false
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
