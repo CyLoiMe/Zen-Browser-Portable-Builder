@@ -47,8 +47,6 @@ jobs:
         
         Write-Host "Target: $version"
         Invoke-WebRequest -Uri $downloadUrl -OutFile "zen_installer.exe"
-        
-        # === 修复：写入全局环境变量，防止最后一步读不到 ===
         echo "VERSION=$version" >> $env:GITHUB_ENV
 
     # 2. 解压 Zen Browser
@@ -58,7 +56,6 @@ jobs:
         New-Item -ItemType Directory -Force -Path "ZenBrowserPortable\App\ZenBrowser"
         New-Item -ItemType Directory -Force -Path "ZenBrowserPortable\App\AppInfo"
         New-Item -ItemType Directory -Force -Path "ZenBrowserPortable\Data"
-        # 保留这个目录以符合 PAF 标准
         New-Item -ItemType Directory -Force -Path "ZenBrowserPortable\Other\Source"
         
         7z x "zen_installer.exe" -o"TempExtract" -y
@@ -70,17 +67,20 @@ jobs:
             if ($zenExe) { Move-Item "$($zenExe.DirectoryName)\*" "ZenBrowserPortable\App\ZenBrowser" }
         }
 
-    # 3. 配置策略与版本 (准备好所有 PAF 需要的配置)
+    # 3. 配置策略与版本
     - name: Configure App
       shell: powershell
       run: |
+        # 禁用更新
         $distDir = "ZenBrowserPortable\App\ZenBrowser\distribution"
         New-Item -ItemType Directory -Force -Path $distDir
         Set-Content -Path "$distDir\policies.json" -Value '{ "policies": { "DisableAppUpdate": true, "ManualAppUpdateOnly": true } }'
 
+        # 写入版本号
         $ver = $env:VERSION
         Set-Content -Path "ZenBrowserPortable\App\AppInfo\version.txt" -Value $ver
 
+        # 处理 appinfo.ini
         $safeVer = $ver -replace "[^0-9.]", ""
         while (($safeVer.ToCharArray() | Where-Object { $_ -eq '.' }).Count -lt 3) { $safeVer += ".0" }
         
@@ -91,8 +91,9 @@ jobs:
         if ($content -notcontains "CommercialUse=true") {
             $content = $content -replace "\[License\]", "[License]`r`nCommercialUse=true"
         }
-        # 强制 ANSI，方便下载后在本地打包不出错
-        [System.IO.File]::WriteAllText($iniPath, $content, [System.Text.Encoding]::Default)
+        
+        # === 使用标准的 UTF8 编码保存 ===
+        Set-Content -Path $iniPath -Value $content -Encoding UTF8
 
     # 4. 创建 help.html
     - name: Create Help File
@@ -108,7 +109,7 @@ jobs:
         set CSC=%windir%\Microsoft.NET\Framework64\v4.0.30319\csc.exe
         "%CSC%" /target:exe /out:ZenBrowserPortable\ZenBrowserPortable.exe /win32icon:appicon.ico /r:System.Windows.Forms.dll Launcher.cs
 
-    # 6. 生成图标 (生成全套 PNG，方便本地打包时不弹窗)
+    # 6. 生成图标
     - name: Generate PAF Icons
       shell: powershell
       run: |
@@ -138,7 +139,6 @@ jobs:
     - name: Upload Release
       uses: softprops/action-gh-release@v1
       with:
-        # 引用全局变量
         tag_name: ${{ env.VERSION }}
         name: Zen Browser Portable ${{ env.VERSION }}
         files: "*.zip"
