@@ -6,7 +6,6 @@
 ---
 
 <a name="english"></a>
-## 🇺🇸 English Version
 
 This project uses **GitHub Actions** to automatically build the **Portable Edition** of Zen Browser. It follows the **PortableApps.com Format (PAF)** standard, allowing it to work as standalone software or integrate perfectly into the PortableApps.com Platform.
 
@@ -70,7 +69,6 @@ This is an unofficial build. Zen Browser belongs to the Zen Team. This project o
 ---
 
 <a name="chinese"></a>
-## 🇨🇳 中文版本
 
 本项目通过 **GitHub Actions** 自动构建 **Zen Browser** 的便携版（Portable Edition）。它遵循 **PortableApps.com** 格式标准，既可以作为独立软件运行，也可以完美集成到 PortableApps 平台中。
 
