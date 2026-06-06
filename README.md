@@ -23,7 +23,7 @@ This project uses **GitHub Actions** to automatically build the **Portable Editi
       * **Reason**: To prevent the browser from self-updating, which could break the portable structure, cause version conflicts, or leave junk files on the host machine. Updates are managed entirely by the Launcher and this repository.
 
 ### 📥 How to Use
-
+#### Notice: If you want to keep websites signed in, uncheck "Clear Cookies and site data every time you close Zen" in Settings → Privacy and Security.
 #### Method 1: Standalone Use (Recommended)
 
 1.  Go to the **Releases** page of this repository.
@@ -102,7 +102,7 @@ This is an unofficial build. Zen Browser belongs to the Zen Team. This project o
       * **原因**：防止浏览器自动升级导致便携结构破坏、版本冲突或在宿主机留下垃圾文件。更新完全由启动器和本仓库接管。
 
 ### 📥 使用方法
-
+#### 提示：如果你想让网站保持登录，需要在浏览器设置里的隐私与安全中取消勾选“每次关闭 Zen 时清除 Cookie 和网站数据”。
 #### 方式一：独立使用 (推荐)
 
 1.  前往本仓库的 **Releases** 页面。
