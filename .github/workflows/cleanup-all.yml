@@ -1,0 +1,363 @@
+# ==========================================================
+# GitHub Actions 全量清理：artifacts -> logs/runs -> releases
+# 放到仓库的 .github/workflows/cleanup-all.yml 即可
+#
+# 为什么拆成三个 job（而不是一个步骤）：
+#   这三类资源在 GitHub 上是互相独立的，彼此不会级联删除：
+#     1. 删 workflow run   -> 不动 artifacts（官方只写 "Deletes a specific workflow run."）
+#     2. 删 artifacts      -> 不动 run 记录，也不动 release
+#     3. 删 release        -> release 与附件消失，但 Git tag 仍在（需再删 git refs）
+#   顺序必须是「先产物后记录」：run 删掉之后，部分 artifact 接口会拿不到归属。
+#
+# 权限：artifacts/runs -> actions: write；releases -> contents: write
+# 建议：第一次跑用默认的 dry_run=true 预演，确认无误后再设 false
+# ==========================================================
+name: Cleanup all Actions history
+
+on:
+  schedule:
+    - cron: '17 3 * * 0'   # 每周日凌晨 3:17 UTC
+  workflow_dispatch:
+    inputs:
+      retain_days:
+        description: 'run / artifact 保留最近 N 天'
+        default: '30'
+      keep_minimum_runs:
+        description: '每个 workflow 至少保留的 run 数'
+        default: '20'
+      keep_minimum_artifacts:
+        description: '至少保留的 artifact 数'
+        default: '10'
+      delete_logs:
+        description: '是否同时删除 run 日志'
+        type: choice
+        options: ['true', 'false']
+        default: 'true'
+      keep_latest_releases:
+        description: '保留最新 N 个 release'
+        default: '10'
+      release_tag_pattern:
+        description: '只删匹配该正则的 release tag（留空=全部），如 ^nightly-'
+        default: ''
+      delete_release_tags:
+        description: '删 release 时连同 Git tag 一起删'
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
+      dry_run:
+        description: '预演（不真删）'
+        type: choice
+        options: ['true', 'false']
+        default: 'true'
+
+jobs:
+  # ---------------- 1 / 3  Artifacts ----------------
+  artifacts:
+    name: Clean artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      actions: write
+    outputs:
+      total: ${{ steps.clean.outputs.total }}
+      ok: ${{ steps.clean.outputs.ok }}
+      fail: ${{ steps.clean.outputs.fail }}
+      freed: ${{ steps.clean.outputs.freed }}
+    steps:
+      - id: clean
+        uses: actions/github-script@v7
+        env:
+          RETAIN_DAYS: ${{ github.event.inputs.retain_days || '30' }}
+          KEEP_MIN_ARTIFACTS: ${{ github.event.inputs.keep_minimum_artifacts || '10' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
+        with:
+          script: |
+            const fs = require('fs');
+            const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+            const { owner, repo } = context.repo;
+            const keepArts = Number(process.env.KEEP_MIN_ARTIFACTS);
+            const cutoff   = Date.now() - Number(process.env.RETAIN_DAYS) * 86400000;
+            const dry      = process.env.DRY_RUN === 'true';
+
+            async function safe(fn, label) {
+              for (let i = 0; i < 6; i++) {
+                try { return await fn(); } catch (e) {
+                  const st = e.status || e.response?.status;
+                  if ((st === 403 || st === 429) && i < 5) {
+                    const w = Math.min(90, 10 * (i + 1));
+                    core.warning(label + ' 限流，等 ' + w + 's');
+                    await sleep(w * 1000);
+                    continue;
+                  }
+                  throw e;
+                }
+              }
+            }
+
+            const list = (await safe(() => github.paginate(github.rest.actions.listArtifactsForRepo,
+              { owner, repo, per_page: 100 }), 'listArtifacts'))
+              .filter(a => !a.expired)
+              .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+
+            const targets = list.slice(keepArts)
+              .filter(a => Date.parse(a.created_at) < cutoff);
+            const freed = targets.reduce((s, a) => s + a.size_in_bytes, 0);
+            core.info('artifact 总数 ' + list.length + '，命中 ' + targets.length +
+                      ' 个，约 ' + (freed / 1048576).toFixed(1) + ' MB');
+
+            let ok = 0, fail = 0;
+            for (let i = 0; i < targets.length; i += 5) {
+              await Promise.all(targets.slice(i, i + 5).map(async (a) => {
+                if (dry) return;
+                try {
+                  await safe(() => github.rest.actions.deleteArtifact(
+                    { owner, repo, artifact_id: a.id }), 'deleteArtifact ' + a.id);
+                  ok++;
+                } catch (e) {
+                  fail++;
+                  core.warning('删除 artifact ' + a.name + ' 失败: ' + e.message);
+                }
+              }));
+              if (i + 5 < targets.length) await sleep(300);
+            }
+
+            fs.appendFileSync(process.env.GITHUB_OUTPUT,
+              'total=' + targets.length + '\n' +
+              'ok=' + ok + '\n' +
+              'fail=' + fail + '\n' +
+              'freed=' + Math.round(freed) + '\n');
+
+  # ---------------- 2 / 3  Logs + Workflow runs ----------------
+  runs:
+    name: Clean workflow runs
+    needs: artifacts
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: write
+    outputs:
+      total: ${{ steps.clean.outputs.total }}
+      ok: ${{ steps.clean.outputs.ok }}
+      fail: ${{ steps.clean.outputs.fail }}
+      logs: ${{ steps.clean.outputs.logs }}
+    steps:
+      - id: clean
+        uses: actions/github-script@v7
+        env:
+          RETAIN_DAYS: ${{ github.event.inputs.retain_days || '30' }}
+          KEEP_MIN_RUNS: ${{ github.event.inputs.keep_minimum_runs || '20' }}
+          DELETE_LOGS: ${{ github.event.inputs.delete_logs || 'true' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
+        with:
+          script: |
+            const fs = require('fs');
+            const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+            const { owner, repo } = context.repo;
+            const keepRuns = Number(process.env.KEEP_MIN_RUNS);
+            const cutoff   = Date.now() - Number(process.env.RETAIN_DAYS) * 86400000;
+            const doLogs   = process.env.DELETE_LOGS === 'true';
+            const dry      = process.env.DRY_RUN === 'true';
+
+            async function safe(fn, label) {
+              for (let i = 0; i < 6; i++) {
+                try { return await fn(); } catch (e) {
+                  const st = e.status || e.response?.status;
+                  if ((st === 403 || st === 429) && i < 5) {
+                    const w = Math.min(90, 10 * (i + 1));
+                    core.warning(label + ' 限流，等 ' + w + 's');
+                    await sleep(w * 1000);
+                    continue;
+                  }
+                  throw e;
+                }
+              }
+            }
+
+            const all = (await safe(() => github.paginate(github.rest.actions.listWorkflowRunsForRepo,
+              { owner, repo, per_page: 100, status: 'completed' }), 'listWorkflowRuns'))
+              .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+
+            // 按 workflow 分组，每个 workflow 至少保留最近 keepRuns 条
+            const seen = new Map();
+            const targets = [];
+            for (const r of all) {
+              if (Date.parse(r.created_at) >= cutoff) continue;
+              const n = (seen.get(r.workflow_id) || 0) + 1;
+              seen.set(r.workflow_id, n);
+              if (n <= keepRuns) continue;
+              targets.push(r);
+            }
+            core.info('run 总数 ' + all.length + '，命中 ' + targets.length + ' 条');
+
+            let ok = 0, fail = 0, logs = 0;
+            for (let i = 0; i < targets.length; i += 5) {
+              await Promise.all(targets.slice(i, i + 5).map(async (r) => {
+                if (dry) return;
+                try {
+                  if (doLogs) {
+                    try {
+                      await safe(() => github.rest.actions.deleteWorkflowRunLogs(
+                        { owner, repo, run_id: r.id }), 'deleteLogs ' + r.id);
+                      logs++;
+                    } catch (_) { /* 日志可能已被级联删除 */ }
+                  }
+                  await safe(() => github.rest.actions.deleteWorkflowRun(
+                    { owner, repo, run_id: r.id }), 'deleteRun ' + r.id);
+                  ok++;
+                } catch (e) {
+                  fail++;
+                  core.warning('删除 run ' + r.id + ' 失败: ' + e.message);
+                }
+              }));
+              if (i + 5 < targets.length) await sleep(300);
+            }
+
+            fs.appendFileSync(process.env.GITHUB_OUTPUT,
+              'total=' + targets.length + '\n' +
+              'ok=' + ok + '\n' +
+              'fail=' + fail + '\n' +
+              'logs=' + logs + '\n');
+
+  # ---------------- 3 / 3  Releases ----------------
+  releases:
+    name: Clean releases
+    needs: runs
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    outputs:
+      total: ${{ steps.clean.outputs.total }}
+      ok: ${{ steps.clean.outputs.ok }}
+      fail: ${{ steps.clean.outputs.fail }}
+      tags: ${{ steps.clean.outputs.tags }}
+      freed: ${{ steps.clean.outputs.freed }}
+    steps:
+      - id: clean
+        uses: actions/github-script@v7
+        env:
+          RETAIN_DAYS: ${{ github.event.inputs.retain_days || '30' }}
+          KEEP_LATEST: ${{ github.event.inputs.keep_latest_releases || '10' }}
+          TAG_PATTERN: ${{ github.event.inputs.release_tag_pattern }}
+          DELETE_TAGS: ${{ github.event.inputs.delete_release_tags || 'false' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
+        with:
+          script: |
+            const fs = require('fs');
+            const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+            const { owner, repo } = context.repo;
+            const keepLatest = Number(process.env.KEEP_LATEST);
+            const cutoff     = Date.now() - Number(process.env.RETAIN_DAYS) * 86400000;
+            const re         = process.env.TAG_PATTERN ? new RegExp(process.env.TAG_PATTERN) : null;
+            const dropTags   = process.env.DELETE_TAGS === 'true';
+            const dry        = process.env.DRY_RUN === 'true';
+
+            async function safe(fn, label) {
+              for (let i = 0; i < 6; i++) {
+                try { return await fn(); } catch (e) {
+                  const st = e.status || e.response?.status;
+                  if ((st === 403 || st === 429) && i < 5) {
+                    const w = Math.min(90, 10 * (i + 1));
+                    core.warning(label + ' 限流，等 ' + w + 's');
+                    await sleep(w * 1000);
+                    continue;
+                  }
+                  throw e;
+                }
+              }
+            }
+
+            const all = (await safe(() => github.paginate(github.rest.repos.listReleases,
+              { owner, repo, per_page: 100 }), 'listReleases'))
+              .filter(r => !r.draft)
+              .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+
+            const targets = all.slice(keepLatest).filter(r => {
+              if (Date.parse(r.created_at) >= cutoff) return false;
+              if (re && !re.test(r.tag_name)) return false;
+              return true;
+            });
+            const freed = targets.reduce((s, r) =>
+              s + (r.assets || []).reduce((x, a) => x + a.size, 0), 0);
+            core.info('release 总数 ' + all.length + '，命中 ' + targets.length +
+                      ' 个，附件约 ' + (freed / 1048576).toFixed(1) + ' MB');
+
+            let ok = 0, fail = 0, tags = 0;
+            for (const r of targets) {
+              if (dry) { core.info('[预演] ' + r.tag_name); continue; }
+              try {
+                await safe(() => github.rest.repos.deleteRelease(
+                  { owner, repo, release_id: r.id }), 'deleteRelease ' + r.tag_name);
+                ok++;
+                if (dropTags) {
+                  try {
+                    await safe(() => github.rest.git.deleteRef(
+                      { owner, repo, ref: 'tags/' + r.tag_name }), 'deleteRef ' + r.tag_name);
+                    tags++;
+                  } catch (e) {
+                    core.warning('删除 tag ' + r.tag_name + ' 失败: ' + e.message);
+                  }
+                }
+              } catch (e) {
+                fail++;
+                core.warning('删除 release ' + r.tag_name + ' 失败: ' + e.message);
+              }
+              await sleep(200);
+            }
+
+            fs.appendFileSync(process.env.GITHUB_OUTPUT,
+              'total=' + targets.length + '\n' +
+              'ok=' + ok + '\n' +
+              'fail=' + fail + '\n' +
+              'tags=' + tags + '\n' +
+              'freed=' + Math.round(freed) + '\n');
+
+  # ---------------- 汇总报告 ----------------
+  report:
+    name: Summary
+    needs: [artifacts, runs, releases]
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Write summary
+        uses: actions/github-script@v7
+        env:
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
+          RETAIN_DAYS: ${{ github.event.inputs.retain_days || '30' }}
+          A_TOTAL: ${{ needs.artifacts.outputs.total }}
+          A_OK: ${{ needs.artifacts.outputs.ok }}
+          A_FAIL: ${{ needs.artifacts.outputs.fail }}
+          A_FREED: ${{ needs.artifacts.outputs.freed }}
+          R_TOTAL: ${{ needs.runs.outputs.total }}
+          R_OK: ${{ needs.runs.outputs.ok }}
+          R_FAIL: ${{ needs.runs.outputs.fail }}
+          R_LOGS: ${{ needs.runs.outputs.logs }}
+          L_TOTAL: ${{ needs.releases.outputs.total }}
+          L_OK: ${{ needs.releases.outputs.ok }}
+          L_FAIL: ${{ needs.releases.outputs.fail }}
+          L_TAGS: ${{ needs.releases.outputs.tags }}
+          L_FREED: ${{ needs.releases.outputs.freed }}
+        with:
+          script: |
+            const mb = (b) => (Number(b || 0) / 1048576).toFixed(1) + ' MB';
+            const dry = process.env.DRY_RUN === 'true';
+            const rows = [
+              '### GitHub Actions 全量清理' + (dry ? '（预演，未真删）' : ''),
+              '',
+              '保留窗口：最近 ' + process.env.RETAIN_DAYS + ' 天',
+              '',
+              '| 资源 | 命中 | 成功 | 失败 | 释放空间 |',
+              '| --- | --- | --- | --- | --- |',
+              '| artifacts | ' + process.env.A_TOTAL + ' | ' + process.env.A_OK + ' | ' +
+                process.env.A_FAIL + ' | ' + mb(process.env.A_FREED) + ' |',
+              '| workflow runs | ' + process.env.R_TOTAL + ' | ' + process.env.R_OK + ' | ' +
+                process.env.R_FAIL + ' | 日志清理 ' + process.env.R_LOGS + ' 条 |',
+              '| releases | ' + process.env.L_TOTAL + ' | ' + process.env.L_OK + ' | ' +
+                process.env.L_FAIL + ' | ' + mb(process.env.L_FREED) +
+                '，删 tag ' + process.env.L_TAGS + ' 个 |',
+            ];
+            core.summary.addRaw(rows.join('\n')).write();
+            rows.forEach(r => core.info(r));
