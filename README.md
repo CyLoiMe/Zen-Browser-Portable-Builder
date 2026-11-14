@@ -13,7 +13,7 @@ This project uses **GitHub Actions** to automatically build the **Portable Editi
 
 ### ✨ Key Features
 
-  * **🚀 Fully Automated Build**: Automatically checks the official Zen Browser repository daily at **UTC 02:00 (10:00 Beijing Time)**. If a new version (containing a Windows installer) is released, it automatically downloads, extracts, packages, and publishes it to the **Releases** page of this repository.
+  * **🚀 Fully Automated Build**: Automatically checks the official Zen Browser repository daily at **UTC 02:00**. If a new version (containing a Windows installer) is released, it automatically downloads, extracts, packages, and publishes it to the **Releases** page of this repository.
   * **💾 Native Portable**: All user data (bookmarks, extensions, history) is stored in the `Data\profile` directory. No traces are left on the host machine after unplugging your USB drive.
   * **⚡ Smart Launcher**:
       * **Instant Start**: Launches the browser immediately without blocking startup for update checks.
@@ -92,7 +92,7 @@ This is an unofficial build. Zen Browser belongs to the Zen Team. This project o
 
 ### ✨ 主要特性
 
-  * **🚀 全自动构建**：每天 **UTC 02:00 (北京时间 10:00)** 自动检查 Zen Browser 官方仓库。如果有新版本发布（且包含 Windows 安装包），会自动下载、解压、打包并发布到本仓库的 Releases 页面。
+  * **🚀 全自动构建**：每天 **UTC 02:00** 自动检查 Zen Browser 官方仓库。如果有新版本发布（且包含 Windows 安装包），会自动下载、解压、打包并发布到本仓库的 Releases 页面。
   * **💾 原生便携**：所有用户数据（书签、扩展、历史记录）均存储在 `Data\profile` 目录下，拔掉 U 盘不留痕迹。
   * **⚡ 智能启动器**：
       * **秒开体验**：启动时不进行阻塞式检查，直接打开浏览器。
